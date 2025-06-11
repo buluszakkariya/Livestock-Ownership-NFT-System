@@ -1,0 +1,23 @@
+[project]
+name = 'Livestock-Ownership-NFT-System'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+[contracts.Livestock-Ownership-NFT-System]
+path = 'contracts/Livestock-Ownership-NFT-System.clar'
+clarity_version = 3
+epoch = 3.1
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
+
+[repl.remote_data]
+enabled = false
+api_url = 'https://api.hiro.so'
