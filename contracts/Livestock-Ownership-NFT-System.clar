@@ -308,3 +308,147 @@
 
 (define-read-only (calculate-premium-quote (coverage-amount uint) (duration uint) (token-id uint))
     (ok (calculate-premium coverage-amount duration token-id)))
+
+(define-map marketplace-listings
+    uint
+    {
+        seller: principal,
+        price: uint,
+        listed-at: uint,
+        expiry: uint,
+        is-active: bool
+    }
+)
+
+(define-map marketplace-offers
+    { token-id: uint, buyer: principal }
+    {
+        offer-amount: uint,
+        offer-expiry: uint,
+        is-active: bool
+    }
+)
+
+(define-map escrow-deposits
+    { token-id: uint, buyer: principal }
+    uint
+)
+
+(define-data-var marketplace-fee-rate uint u250)
+(define-data-var marketplace-fee-recipient principal contract-owner)
+
+(define-constant err-not-listed (err u111))
+(define-constant err-listing-expired (err u112))
+(define-constant err-insufficient-payment (err u113))
+(define-constant err-offer-expired (err u114))
+(define-constant err-self-purchase (err u115))
+
+(define-public (list-for-sale
+    (token-id uint)
+    (price uint)
+    (duration uint))
+    (let ((owner (unwrap! (nft-get-owner? livestock-token token-id) err-invalid-token)))
+        (asserts! (is-eq tx-sender owner) err-not-token-owner)
+        (map-set marketplace-listings token-id {
+            seller: tx-sender,
+            price: price,
+            listed-at: stacks-block-height,
+            expiry: (+ stacks-block-height duration),
+            is-active: true
+        })
+        (ok true)))
+
+(define-public (delist-from-sale (token-id uint))
+    (let ((listing (unwrap! (map-get? marketplace-listings token-id) err-not-listed)))
+        (asserts! (is-eq tx-sender (get seller listing)) err-not-token-owner)
+        (map-set marketplace-listings token-id
+            (merge listing { is-active: false }))
+        (ok true)))
+
+(define-public (purchase-livestock (token-id uint))
+    (let ((listing (unwrap! (map-get? marketplace-listings token-id) err-not-listed))
+          (owner (unwrap! (nft-get-owner? livestock-token token-id) err-invalid-token))
+          (marketplace-fee (/ (* (get price listing) (var-get marketplace-fee-rate)) u10000))
+          (seller-payment (- (get price listing) marketplace-fee)))
+        (asserts! (get is-active listing) err-not-listed)
+        (asserts! (< stacks-block-height (get expiry listing)) err-listing-expired)
+        (asserts! (not (is-eq tx-sender (get seller listing))) err-self-purchase)
+        (asserts! (>= (stx-get-balance tx-sender) (get price listing)) err-insufficient-payment)
+        (try! (stx-transfer? seller-payment tx-sender (get seller listing)))
+        (try! (stx-transfer? marketplace-fee tx-sender (var-get marketplace-fee-recipient)))
+        (try! (nft-transfer? livestock-token token-id owner tx-sender))
+        (map-set marketplace-listings token-id
+            (merge listing { is-active: false }))
+        (ok true)))
+
+(define-public (make-offer
+    (token-id uint)
+    (offer-amount uint)
+    (offer-duration uint))
+    (let ((listing (unwrap! (map-get? marketplace-listings token-id) err-not-listed)))
+        (asserts! (get is-active listing) err-not-listed)
+        (asserts! (not (is-eq tx-sender (get seller listing))) err-self-purchase)
+        (asserts! (>= (stx-get-balance tx-sender) offer-amount) err-insufficient-payment)
+        (try! (stx-transfer? offer-amount tx-sender (as-contract tx-sender)))
+        (map-set escrow-deposits { token-id: token-id, buyer: tx-sender } offer-amount)
+        (map-set marketplace-offers { token-id: token-id, buyer: tx-sender } {
+            offer-amount: offer-amount,
+            offer-expiry: (+ stacks-block-height offer-duration),
+            is-active: true
+        })
+        (ok true)))
+
+(define-public (accept-offer
+    (token-id uint)
+    (buyer principal))
+    (let ((listing (unwrap! (map-get? marketplace-listings token-id) err-not-listed))
+          (offer (unwrap! (map-get? marketplace-offers { token-id: token-id, buyer: buyer }) err-invalid-token))
+          (escrow-amount (unwrap! (map-get? escrow-deposits { token-id: token-id, buyer: buyer }) err-invalid-token))
+          (owner (unwrap! (nft-get-owner? livestock-token token-id) err-invalid-token))
+          (marketplace-fee (/ (* (get offer-amount offer) (var-get marketplace-fee-rate)) u10000))
+          (seller-payment (- (get offer-amount offer) marketplace-fee)))
+        (asserts! (is-eq tx-sender (get seller listing)) err-not-token-owner)
+        (asserts! (get is-active offer) err-invalid-token)
+        (asserts! (< stacks-block-height (get offer-expiry offer)) err-offer-expired)
+        (try! (as-contract (stx-transfer? seller-payment tx-sender (get seller listing))))
+        (try! (as-contract (stx-transfer? marketplace-fee tx-sender (var-get marketplace-fee-recipient))))
+        (try! (nft-transfer? livestock-token token-id owner buyer))
+        (map-delete escrow-deposits { token-id: token-id, buyer: buyer })
+        (map-set marketplace-offers { token-id: token-id, buyer: buyer }
+            (merge offer { is-active: false }))
+        (map-set marketplace-listings token-id
+            (merge listing { is-active: false }))
+        (ok true)))
+
+(define-public (withdraw-offer
+    (token-id uint))
+    (let ((offer (unwrap! (map-get? marketplace-offers { token-id: token-id, buyer: tx-sender }) err-invalid-token))
+          (escrow-amount (unwrap! (map-get? escrow-deposits { token-id: token-id, buyer: tx-sender }) err-invalid-token)))
+        (asserts! (get is-active offer) err-invalid-token)
+        (try! (as-contract (stx-transfer? escrow-amount tx-sender tx-sender)))
+        (map-delete escrow-deposits { token-id: token-id, buyer: tx-sender })
+        (map-set marketplace-offers { token-id: token-id, buyer: tx-sender }
+            (merge offer { is-active: false }))
+        (ok true)))
+
+(define-public (set-marketplace-fee (new-fee-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= new-fee-rate u1000) err-invalid-token)
+        (var-set marketplace-fee-rate new-fee-rate)
+        (ok true)))
+
+(define-read-only (get-listing (token-id uint))
+    (map-get? marketplace-listings token-id))
+
+(define-read-only (get-offer (token-id uint) (buyer principal))
+    (map-get? marketplace-offers { token-id: token-id, buyer: buyer }))
+
+(define-read-only (get-escrow-amount (token-id uint) (buyer principal))
+    (map-get? escrow-deposits { token-id: token-id, buyer: buyer }))
+
+(define-read-only (get-marketplace-fee-rate)
+    (var-get marketplace-fee-rate))
+
+(define-read-only (calculate-marketplace-fee (price uint))
+    (/ (* price (var-get marketplace-fee-rate)) u10000))
