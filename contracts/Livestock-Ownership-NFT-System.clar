@@ -452,3 +452,182 @@
 
 (define-read-only (calculate-marketplace-fee (price uint))
     (/ (* price (var-get marketplace-fee-rate)) u10000))
+
+(define-map vet-providers
+    principal
+    {
+        name: (string-ascii 50),
+        specialization: (string-ascii 30),
+        service-fee: uint,
+        total-appointments: uint,
+        total-rating: uint,
+        is-active: bool,
+        registered-at: uint
+    }
+)
+
+(define-map vet-appointments
+    { token-id: uint, appointment-id: uint }
+    {
+        provider: principal,
+        owner: principal,
+        service-type: (string-ascii 30),
+        scheduled-at: uint,
+        fee: uint,
+        status: (string-ascii 20),
+        completed-at: (optional uint),
+        notes: (string-ascii 100)
+    }
+)
+
+(define-map appointment-ratings
+    { token-id: uint, appointment-id: uint }
+    {
+        rating: uint,
+        review: (string-ascii 100),
+        rated-at: uint
+    }
+)
+
+(define-map livestock-appointment-counter
+    uint
+    uint
+)
+
+(define-data-var next-global-appointment-id uint u0)
+
+(define-constant err-not-provider (err u116))
+(define-constant err-provider-inactive (err u117))
+(define-constant err-appointment-exists (err u118))
+(define-constant err-invalid-appointment (err u119))
+(define-constant err-appointment-completed (err u120))
+(define-constant err-invalid-rating (err u121))
+(define-constant err-already-rated (err u122))
+
+(define-public (register-vet-provider
+    (name (string-ascii 50))
+    (specialization (string-ascii 30))
+    (service-fee uint))
+    (begin
+        (asserts! (is-none (map-get? vet-providers tx-sender)) err-token-exists)
+        (map-set vet-providers tx-sender {
+            name: name,
+            specialization: specialization,
+            service-fee: service-fee,
+            total-appointments: u0,
+            total-rating: u0,
+            is-active: true,
+            registered-at: stacks-block-height
+        })
+        (ok true)))
+
+(define-public (update-provider-status (is-active bool))
+    (let ((provider (unwrap! (map-get? vet-providers tx-sender) err-not-provider)))
+        (map-set vet-providers tx-sender
+            (merge provider { is-active: is-active }))
+        (ok true)))
+
+(define-public (update-service-fee (new-fee uint))
+    (let ((provider (unwrap! (map-get? vet-providers tx-sender) err-not-provider)))
+        (map-set vet-providers tx-sender
+            (merge provider { service-fee: new-fee }))
+        (ok true)))
+
+(define-public (book-vet-appointment
+    (token-id uint)
+    (provider principal)
+    (service-type (string-ascii 30))
+    (scheduled-at uint)
+    (notes (string-ascii 100)))
+    (let
+        ((owner (unwrap! (nft-get-owner? livestock-token token-id) err-invalid-token))
+         (provider-data (unwrap! (map-get? vet-providers provider) err-not-provider))
+         (appointment-count (default-to u0 (map-get? livestock-appointment-counter token-id)))
+         (appointment-id (+ appointment-count u1)))
+        (asserts! (is-eq tx-sender owner) err-not-token-owner)
+        (asserts! (get is-active provider-data) err-provider-inactive)
+        (asserts! (>= (stx-get-balance tx-sender) (get service-fee provider-data)) err-insufficient-payment)
+        (try! (stx-transfer? (get service-fee provider-data) tx-sender provider))
+        (map-set livestock-appointment-counter token-id appointment-id)
+        (map-set vet-appointments { token-id: token-id, appointment-id: appointment-id } {
+            provider: provider,
+            owner: tx-sender,
+            service-type: service-type,
+            scheduled-at: scheduled-at,
+            fee: (get service-fee provider-data),
+            status: "scheduled",
+            completed-at: none,
+            notes: notes
+        })
+        (map-set vet-providers provider
+            (merge provider-data { total-appointments: (+ (get total-appointments provider-data) u1) }))
+        (ok appointment-id)))
+
+(define-public (cancel-appointment
+    (token-id uint)
+    (appointment-id uint))
+    (let
+        ((appointment (unwrap! (map-get? vet-appointments { token-id: token-id, appointment-id: appointment-id }) err-invalid-appointment))
+         (owner (unwrap! (nft-get-owner? livestock-token token-id) err-invalid-token)))
+        (asserts! (is-eq tx-sender owner) err-not-token-owner)
+        (asserts! (is-eq (get status appointment) "scheduled") err-appointment-completed)
+        (map-set vet-appointments { token-id: token-id, appointment-id: appointment-id }
+            (merge appointment { status: "cancelled" }))
+        (ok true)))
+
+(define-public (complete-appointment
+    (token-id uint)
+    (appointment-id uint)
+    (service-notes (string-ascii 100)))
+    (let ((appointment (unwrap! (map-get? vet-appointments { token-id: token-id, appointment-id: appointment-id }) err-invalid-appointment)))
+        (asserts! (is-eq tx-sender (get provider appointment)) err-not-provider)
+        (asserts! (is-eq (get status appointment) "scheduled") err-appointment-completed)
+        (map-set vet-appointments { token-id: token-id, appointment-id: appointment-id }
+            (merge appointment { 
+                status: "completed",
+                completed-at: (some stacks-block-height),
+                notes: service-notes
+            }))
+        (ok true)))
+
+(define-public (rate-appointment
+    (token-id uint)
+    (appointment-id uint)
+    (rating uint)
+    (review (string-ascii 100)))
+    (let
+        ((appointment (unwrap! (map-get? vet-appointments { token-id: token-id, appointment-id: appointment-id }) err-invalid-appointment))
+         (owner (unwrap! (nft-get-owner? livestock-token token-id) err-invalid-token))
+         (provider-data (unwrap! (map-get? vet-providers (get provider appointment)) err-not-provider)))
+        (asserts! (is-eq tx-sender owner) err-not-token-owner)
+        (asserts! (is-eq (get status appointment) "completed") err-invalid-appointment)
+        (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+        (asserts! (is-none (map-get? appointment-ratings { token-id: token-id, appointment-id: appointment-id })) err-already-rated)
+        (map-set appointment-ratings { token-id: token-id, appointment-id: appointment-id } {
+            rating: rating,
+            review: review,
+            rated-at: stacks-block-height
+        })
+        (map-set vet-providers (get provider appointment)
+            (merge provider-data { total-rating: (+ (get total-rating provider-data) rating) }))
+        (ok true)))
+
+(define-read-only (get-provider-info (provider principal))
+    (map-get? vet-providers provider))
+
+(define-read-only (get-appointment-details (token-id uint) (appointment-id uint))
+    (map-get? vet-appointments { token-id: token-id, appointment-id: appointment-id }))
+
+(define-read-only (get-appointment-rating (token-id uint) (appointment-id uint))
+    (map-get? appointment-ratings { token-id: token-id, appointment-id: appointment-id }))
+
+(define-read-only (get-provider-average-rating (provider principal))
+    (match (map-get? vet-providers provider)
+        provider-data
+            (if (> (get total-appointments provider-data) u0)
+                (ok (/ (get total-rating provider-data) (get total-appointments provider-data)))
+                (ok u0))
+        err-not-provider))
+
+(define-read-only (get-livestock-appointment-count (token-id uint))
+    (default-to u0 (map-get? livestock-appointment-counter token-id)))
